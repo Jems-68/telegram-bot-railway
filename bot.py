@@ -1,169 +1,96 @@
 import os
-import asyncio
-from datetime import datetime, timedelta
-from collections import deque
-
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, ContextTypes,
-    CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+
+# Configuración de logs
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
-# ===== Config por variables de entorno =====
-TOKEN = os.environ["TOKEN"]  # requerido
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@infernoplacere")  # ej. @infernoplacere
-DEFAULT_WAIT_MINUTES = int(os.getenv("WAIT_MINUTES", "30"))  # 30/60/90
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))  # max 100
+# --- Obtener el token de las variables de entorno ---
+TOKEN = os.environ.get("BOT_TOKEN")  # ahora BOT_TOKEN
+if not TOKEN:
+    raise ValueError("❌ No se encontró la variable BOT_TOKEN. Configúrala en Railway.")
 
-# ===== Estado global =====
-pendientes = deque()          # guarda objetos telegram.Message
-wait_minutes = DEFAULT_WAIT_MINUTES
-scheduler_running = False
-next_fire_at = None           # datetime de próximo envío
-lock = asyncio.Lock()         # para proteger el estado compartido
+# --- ID o @username del canal de destino ---
+TARGET_CHAT_ID = "@inferno_placere"  # cambia por el username exacto de tu canal
 
+# --- Estado global ---
+estado = {
+    "tiempo": 30,  # tiempo por defecto en minutos
+    "archivos": []
+}
 
-def kb_tiempo():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("⏱️ 30 min", callback_data="set_wait_30"),
-        InlineKeyboardButton("⏱️ 60 min", callback_data="set_wait_60"),
-        InlineKeyboardButton("⏱️ 90 min", callback_data="set_wait_90"),
-    ]])
-
+# --- Comando inicio ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("⏱ 30 min", callback_data="set_30"),
+            InlineKeyboardButton("⏱ 60 min", callback_data="set_60"),
+            InlineKeyboardButton("⏱ 90 min", callback_data="set_90"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "¡Listo! Envíame archivos. Elige el tiempo de espera entre lotes:",
-        reply_markup=kb_tiempo()
+        f"👋 Hola, el bot está activo.\n⏱ Tiempo actual: {estado['tiempo']} minutos.",
+        reply_markup=reply_markup
     )
 
-async def show_tiempo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Tiempo actual: {wait_minutes} min. Cambiar:",
-        reply_markup=kb_tiempo()
-    )
+# --- Manejo de botones ---
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "set_30":
+        estado["tiempo"] = 30
+    elif query.data == "set_60":
+        estado["tiempo"] = 60
+    elif query.data == "set_90":
+        estado["tiempo"] = 90
+    await query.edit_message_text(text=f"✅ Tiempo cambiado a {estado['tiempo']} minutos.")
 
-async def handle_set_tiempo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global wait_minutes
-    q = update.callback_query
-    await q.answer()
-
-    if q.data == "set_wait_30":
-        wait_minutes = 30
-    elif q.data == "set_wait_60":
-        wait_minutes = 60
-    elif q.data == "set_wait_90":
-        wait_minutes = 90
-
-    # Nota: NO ajustamos next_fire_at aquí. El nuevo tiempo aplica al siguiente ciclo.
-    await q.edit_message_text(f"✅ Tiempo actualizado: {wait_minutes} minutos.")
-
+# --- Recepción de archivos ---
 async def recibir_archivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe documentos/fotos/videos/audios y los encola."""
-    msg = update.message
-    if not msg:
+    if update.message.document or update.message.photo or update.message.video:
+        estado["archivos"].append(update.message)
+        await update.message.reply_text("📥 Archivo recibido y en cola.")
+
+# --- Enviar en lotes ---
+async def enviar_lotes(context: ContextTypes.DEFAULT_TYPE):
+    if not estado["archivos"]:
         return
+    
+    lote = estado["archivos"][:100]  # máximo 100
+    estado["archivos"] = estado["archivos"][100:]
 
-    if msg.document or msg.photo or msg.video or msg.audio or msg.animation or msg.sticker:
-        async with lock:
-            pendientes.append(msg)
+    for msg in lote:
+        try:
+            if msg.document:
+                await context.bot.send_document(chat_id=TARGET_CHAT_ID, document=msg.document.file_id)
+            elif msg.photo:
+                await context.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=msg.photo[-1].file_id)
+            elif msg.video:
+                await context.bot.send_video(chat_id=TARGET_CHAT_ID, video=msg.video.file_id)
+            await context.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id)
+        except Exception as e:
+            logging.error(f"Error al enviar archivo: {e}")
 
-            # Si no hay scheduler activo, lo iniciamos y fijamos el primer disparo
-            global scheduler_running, next_fire_at
-            if not scheduler_running:
-                scheduler_running = True
-                next_fire_at = datetime.now() + timedelta(minutes=wait_minutes)
-                asyncio.create_task(scheduler(context))
+    # programar el siguiente envío
+    context.job_queue.run_once(enviar_lotes, estado["tiempo"] * 60)
 
-        await msg.reply_text(
-            f"📦 Guardado. Se enviará en lotes de hasta {BATCH_SIZE}."
-        )
-
-async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with lock:
-        total = len(pendientes)
-        running = scheduler_running
-        nfa = next_fire_at
-
-    if running and nfa:
-        secs = int((nfa - datetime.now()).total_seconds())
-        if secs < 0: secs = 0
-        mins, s = divmod(secs, 60)
-        eta = f"{mins}m {s}s"
-    else:
-        eta = "—"
-
-    await update.message.reply_text(
-        "📊 Estado del bot\n"
-        f"- Canal destino: {CHANNEL_ID}\n"
-        f"- Pendientes: {total}\n"
-        f"- Límite por lote: {BATCH_SIZE}\n"
-        f"- Tiempo entre lotes: {wait_minutes} min\n"
-        f"- Próximo envío en: {eta}"
-    )
-
-async def scheduler(context: ContextTypes.DEFAULT_TYPE):
-    """Ciclo que dispara envíos cada 'wait_minutes' cuando hay pendientes.
-       En cada disparo ENVÍA LOS ÚLTIMOS 100 (o menos) y luego vuelve a esperar.
-    """
-    global scheduler_running, next_fire_at
-
-    while True:
-        async with lock:
-            if not pendientes:
-                # Nada que hacer: parar scheduler
-                scheduler_running = False
-                next_fire_at = None
-                return
-            fire_at = next_fire_at or (datetime.now() + timedelta(minutes=wait_minutes))
-
-        # Dormir hasta el próximo disparo
-        sleep_secs = max(0, int((fire_at - datetime.now()).total_seconds()))
-        await asyncio.sleep(sleep_secs)
-
-        # Armar lote: TOMAR LOS MÁS RECIENTES (últimos) hasta BATCH_SIZE
-        async with lock:
-            if not pendientes:
-                # Se vació mientras dormíamos
-                scheduler_running = False
-                next_fire_at = None
-                return
-
-            # Tomar últimos N
-            take = min(BATCH_SIZE, len(pendientes))
-            # seleccionamos en orden "del más antiguo dentro del lote al más nuevo" para publicar ordenado
-            lote = list(pendientes)[-take:]
-            # recortar cola
-            for _ in range(take):
-                pendientes.pop()
-
-        # Enviar el lote
-        for m in lote:
-            try:
-                await m.copy(chat_id=CHANNEL_ID)
-                # borrar del chat privado con el bot
-                try:
-                    await m.delete()
-                except Exception:
-                    pass
-            except Exception as e:
-                print(f"[WARN] Falló enviar/copy/delete: {e}")
-
-        # Programar siguiente disparo usando el wait_minutes vigente
-        async with lock:
-            next_fire_at = datetime.now() + timedelta(minutes=wait_minutes)
-
+# --- Arranque ---
 def main():
-    app = Application.builder().token(TOKEN).build()
+    application = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("estado", estado))
-    app.add_handler(CommandHandler("tiempo", show_tiempo))
-    app.add_handler(CallbackQueryHandler(handle_set_tiempo))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, recibir_archivo))
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, recibir_archivo))
 
-    print("🤖 Bot en ejecución (polling)…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # programar el primer envío
+    application.job_queue.run_once(enviar_lotes, estado["tiempo"] * 60)
+
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
