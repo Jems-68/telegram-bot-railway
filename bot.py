@@ -81,6 +81,8 @@ async def enviar_lotes(context: ContextTypes.DEFAULT_TYPE):
 # --- Arranque ---
 def main():
     application = Application.builder().token(TOKEN).build()
+    job_queue = application.job_queue
+
 
     # Handlers
     application.add_handler(CommandHandler("start", start))
